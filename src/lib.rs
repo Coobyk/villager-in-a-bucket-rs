@@ -44,18 +44,24 @@ fn bucket_for_kind(kind: &str) -> Option<String> {
         .find_map(|(k, path)| (*k == kind).then_some(format!("villager_in_a_bucket:{path}")))
 }
 
-/// The stack the player's `hand` writes to: 0..=8 main hand, 40 off hand.
+/// The hotbar/inventory slot the off hand holds.
+const OFFHAND_SLOT: u32 = 40;
+
+/// The stack the player's `hand` writes to: 0..=8 main hand, `OFFHAND_SLOT`
+/// off hand.
 fn hand_slot(host: &mut dyn ServerHost, player: PlayerRef, hand: Hand) -> Option<u32> {
     match hand {
         Hand::Main => player.selected_slot(host).map(|slot| slot as u32),
-        Hand::Off => Some(40),
+        Hand::Off => Some(OFFHAND_SLOT),
     }
 }
 
-/// Vanilla `ItemUtils.createFilledResult`: creative keeps the used stack
-/// and adds the result (when not already there); otherwise the stack is
-/// replaced by the result, or shrunk by one with the result given.
-fn swap_held(
+/// Vanilla `ItemUtils.createFilledResult` with `preventDuplicates`: creative
+/// keeps the used stack and adds the result only when the inventory has no
+/// matching stack (same item and components); otherwise the stack is
+/// replaced by the result, or shrunk by one with the result given. Pickup
+/// and placement share this so they cannot diverge.
+fn give_or_swap(
     host: &mut dyn ServerHost,
     player: PlayerRef,
     hand: Hand,
@@ -63,7 +69,18 @@ fn swap_held(
     result: ItemStack,
 ) -> bool {
     if player.has_infinite_materials(host).unwrap_or(false) {
-        return player.give_stack(host, result).is_ok();
+        // preventDuplicates: no second copy of the result for creative.
+        let has_result = player
+            .inventory(host)
+            .map(|slots| {
+                slots.iter().any(|s| {
+                    s.item() == result.item()
+                        && s.components().map(|c| c.as_nbt())
+                            == result.components().map(|c| c.as_nbt())
+                })
+            })
+            .unwrap_or(false);
+        return has_result || player.give_stack(host, result).is_ok();
     }
     let Some(slot) = hand_slot(host, player, hand) else {
         return false;
@@ -149,34 +166,8 @@ impl ItemPart for BucketPart {
                 else {
                     return Some(InteractionResult::Fail);
                 };
-                if player.has_infinite_materials(host).unwrap_or(false) {
-                    // preventDuplicates: no second plain bucket for creative.
-                    let has_empty = player
-                        .inventory(host)
-                        .map(|slots| {
-                            slots
-                                .iter()
-                                .any(|s| s.item() == bucket && s.components().is_none())
-                        })
-                        .unwrap_or(false);
-                    if !has_empty {
-                        let _ = player.give_stack(host, ItemStack::of(bucket));
-                    }
-                } else {
-                    let Some(slot) = hand_slot(host, player, event.hand) else {
-                        return Some(InteractionResult::Fail);
-                    };
-                    if event.stack.count() > 1 {
-                        if player
-                            .set_inventory_slot(host, slot, event.stack.clone().shrink(1))
-                            .is_ok()
-                        {
-                            let _ = player.give_stack(host, ItemStack::of(bucket));
-                        }
-                    } else {
-                        let _ =
-                            player.set_inventory_slot(host, slot, Some(ItemStack::of(bucket)));
-                    }
+                if !give_or_swap(host, player, event.hand, event.stack, ItemStack::of(bucket)) {
+                    return Some(InteractionResult::Fail);
                 }
                 Some(InteractionResult::SuccessServer)
             }
@@ -221,7 +212,9 @@ impl Hooks for Mod {
                 let filled_key: ItemKey = Identifier::parse(&bucket_item)
                     .ok()
                     .and_then(|id| host.item_key(&id))?;
-                let entity = host.entity(event.entity as u32)?;
+                let entity = u32::try_from(event.entity)
+                    .ok()
+                    .and_then(|id| host.entity(id))?;
                 let player = host.players().acting_player()?;
 
                 // The whole saved entity (`saveWithoutId`), minus what a
@@ -245,7 +238,7 @@ impl Hooks for Mod {
                     return None;
                 }
 
-                if !swap_held(host, player, event.hand, stack, filled) {
+                if !give_or_swap(host, player, event.hand, stack, filled) {
                     return Some(InteractionResult::Fail);
                 }
 
@@ -268,7 +261,8 @@ impl Hooks for Mod {
     /// (`tadpole_bucket` already stacks to 1 and has bucket arm motion).
     fn items(&self, _: &RegistrationContext, event: &mut ItemsEvent<'_>) {
         for (_, path) in KINDS {
-            let mut declaration = Item::new(path, "minecraft:tadpole_bucket");
+            let item = format!("villager_in_a_bucket:{path}");
+            let mut declaration = Item::new(item.as_str(), "minecraft:tadpole_bucket");
             declaration.max_stack_size = Some(1);
             event.items.push(declaration);
         }
